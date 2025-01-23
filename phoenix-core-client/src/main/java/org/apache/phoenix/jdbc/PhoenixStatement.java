@@ -18,9 +18,7 @@
 package org.apache.phoenix.jdbc;
 
 import static org.apache.phoenix.exception.SQLExceptionCode.CANNOT_DROP_CDC_INDEX;
-import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_MUTATION_SQL_COUNTER;
-import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_QUERY_TIME;
-import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_SELECT_SQL_COUNTER;
+import static org.apache.phoenix.monitoring.GlobalClientMetrics.*;
 import static org.apache.phoenix.monitoring.MetricType.ATOMIC_UPSERT_SQL_COUNTER;
 import static org.apache.phoenix.monitoring.MetricType.ATOMIC_UPSERT_SQL_QUERY_TIME;
 import static org.apache.phoenix.monitoring.MetricType.DELETE_AGGREGATE_FAILURE_SQL_COUNTER;
@@ -367,6 +365,9 @@ public class PhoenixStatement implements PhoenixMonitoredStatement, SQLCloseable
                             clearResultSet();
                             PhoenixResultSet rs = null;
                             QueryPlan plan = null;
+                            long queryPlanCreationTime = 0;
+                            long queryOptimizerTime = 0;
+                            long queryResultSetTime = 0;
                             try {
                                 PhoenixConnection conn = getConnection();
                                 conn.checkOpen();
@@ -376,8 +377,10 @@ public class PhoenixStatement implements PhoenixMonitoredStatement, SQLCloseable
                                         && stmt.getOperation() != Operation.UPGRADE) {
                                     throw new UpgradeRequiredException();
                                 }
+                                final long queryPlanCreationStartTime = System.nanoTime();
                                 plan = stmt.compilePlan(PhoenixStatement.this,
                                                 Sequence.ValueOp.VALIDATE_SEQUENCE);
+                                queryPlanCreationTime = System.nanoTime() - queryPlanCreationStartTime;
                                 // Send mutations to hbase, so they are visible to subsequent reads.
                                 // Use original plan for data table so that data and immutable indexes will be sent
                                 // TODO: for joins, we need to iterate through all tables, but we need the original table,
@@ -387,9 +390,11 @@ public class PhoenixStatement implements PhoenixMonitoredStatement, SQLCloseable
                                 }
                                 Iterator<TableRef> tableRefs = plan.getSourceRefs().iterator();
                                 connection.getMutationState().sendUncommitted(tableRefs);
+                                final long queryOptimizerStartTime = System.nanoTime();
                                 plan =
                                         connection.getQueryServices().getOptimizer()
                                                 .optimize(PhoenixStatement.this, plan);
+                                queryOptimizerTime = System.nanoTime() - queryOptimizerStartTime;
                                 setLastQueryPlan(plan);
 
                                 //verify metadata for the table/view/index in the query plan
@@ -426,9 +431,11 @@ public class PhoenixStatement implements PhoenixMonitoredStatement, SQLCloseable
                                                     null);
                                 }
                                 context.getOverallQueryMetrics().startQuery();
+                                final long queryResultSetStartTime = System.nanoTime();
                                 rs =
                                         newResultSet(resultIterator, plan.getProjector(),
                                                 plan.getContext());
+                                queryResultSetTime = System.nanoTime() - queryResultSetStartTime;
                                 // newResultset sets lastResultset
                                 setLastQueryPlan(plan);
                                 setLastUpdateCount(NO_UPDATE);
@@ -509,6 +516,10 @@ public class PhoenixStatement implements PhoenixMonitoredStatement, SQLCloseable
                                     long
                                             executeQueryTimeSpent =
                                             EnvironmentEdgeManager.currentTimeMillis() - startTime;
+                                    GLOBAL_QUERY_PLAN_TIME.update(queryPlanCreationTime);
+                                    GLOBAL_QUERY_OPTIMIZER_TIME.update(queryOptimizerTime);
+                                    GLOBAL_QUERY_RESULT_SET_TIME.update(queryResultSetTime);
+
                                     if (tableName != null) {
 
                                         TableMetricsManager

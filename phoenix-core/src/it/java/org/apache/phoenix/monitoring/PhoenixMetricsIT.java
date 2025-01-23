@@ -31,6 +31,9 @@ import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_PHOENIX_C
 import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_PHOENIX_CONNECTIONS_THROTTLED_COUNTER;
 import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_QUERY_SERVICES_COUNTER;
 import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_QUERY_TIME;
+import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_QUERY_PLAN_TIME;
+import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_QUERY_OPTIMIZER_TIME;
+import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_QUERY_RESULT_SET_TIME;
 import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_QUERY_TIMEOUT_COUNTER;
 import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_REJECTED_TASK_COUNTER;
 import static org.apache.phoenix.monitoring.GlobalClientMetrics.GLOBAL_SCAN_BYTES;
@@ -199,6 +202,9 @@ public class PhoenixMetricsIT extends BasePhoenixMetricsIT {
 
         assertTrue(GLOBAL_SCAN_BYTES.getMetric().getValue() > 0);
         assertTrue(GLOBAL_QUERY_TIME.getMetric().getValue() > 0);
+        assertTrue(GLOBAL_QUERY_PLAN_TIME.getMetric().getValue() > 0);
+        assertTrue(GLOBAL_QUERY_OPTIMIZER_TIME.getMetric().getValue() > 0);
+        assertTrue(GLOBAL_QUERY_RESULT_SET_TIME.getMetric().getValue() > 0);
         assertTrue(GLOBAL_TASK_END_TO_END_TIME.getMetric().getValue() > 0);
         assertTrue(GLOBAL_TASK_EXECUTION_TIME.getMetric().getValue() > 0);
 
@@ -252,6 +258,9 @@ public class PhoenixMetricsIT extends BasePhoenixMetricsIT {
         assertEquals(1, GLOBAL_MUTATION_SQL_COUNTER.getMetric().getValue());
         assertEquals(1, GLOBAL_NUM_PARALLEL_SCANS.getMetric().getValue());
         assertEquals(0, GLOBAL_QUERY_TIME.getMetric().getValue());
+        assertEquals(0, GLOBAL_QUERY_PLAN_TIME.getMetric().getValue());
+        assertEquals(0, GLOBAL_QUERY_OPTIMIZER_TIME.getMetric().getValue());
+        assertEquals(0, GLOBAL_QUERY_RESULT_SET_TIME.getMetric().getValue());
         assertTrue(GLOBAL_SCAN_BYTES.getMetric().getValue() > 0);
         assertTrue(GLOBAL_MUTATION_BYTES.getMetric().getValue() > 0);
         assertTrue(GLOBAL_MUTATION_COMMIT_TIME.getMetric().getValue() > 0);

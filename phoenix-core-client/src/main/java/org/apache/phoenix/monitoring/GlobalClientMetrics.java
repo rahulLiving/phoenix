@@ -68,7 +68,6 @@ import static org.apache.phoenix.monitoring.MetricType.HA_PARALLEL_CONNECTION_CR
 import static org.apache.phoenix.monitoring.MetricType.HA_PARALLEL_CONNECTION_ERROR_COUNTER;
 import static org.apache.phoenix.monitoring.MetricType.CLIENT_METADATA_CACHE_HIT_COUNTER;
 import static org.apache.phoenix.monitoring.MetricType.CLIENT_METADATA_CACHE_MISS_COUNTER;
-
 import static org.apache.phoenix.monitoring.MetricType.COUNT_RPC_CALLS;
 import static org.apache.phoenix.monitoring.MetricType.COUNT_REMOTE_RPC_CALLS;
 import static org.apache.phoenix.monitoring.MetricType.COUNT_MILLS_BETWEEN_NEXTS;
@@ -110,6 +109,9 @@ public enum GlobalClientMetrics {
     GLOBAL_MUTATION_INDEX_COMMIT_FAILURE_COUNT(INDEX_COMMIT_FAILURE_SIZE),
     GLOBAL_MUTATION_SYSCAT_TIME(MUTATION_SYSCAT_TIME),
     GLOBAL_QUERY_TIME(QUERY_TIME),
+    GLOBAL_QUERY_PLAN_TIME(QUERY_PLAN_TIME),
+    GLOBAL_QUERY_OPTIMIZER_TIME(QUERY_OPTIMIZE_TIME),
+    GLOBAL_QUERY_RESULT_SET_TIME(QUERY_RESULT_SET_TIME),
     GLOBAL_NUM_PARALLEL_SCANS(NUM_PARALLEL_SCANS),
     GLOBAL_SCAN_BYTES(SCAN_BYTES),
     GLOBAL_SPOOL_FILE_SIZE(SPOOL_FILE_SIZE),

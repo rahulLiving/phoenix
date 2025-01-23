@@ -118,6 +118,9 @@ public enum MetricType {
             + " results", LogLevel.DEBUG, PLong.INSTANCE),
     // query (read) related metrics
     QUERY_TIME("qt", "Query times",LogLevel.OFF, PLong.INSTANCE),
+    QUERY_PLAN_TIME("qpt", "Query plan creation time in nanoseconds", LogLevel.OFF, PLong.INSTANCE),
+    QUERY_OPTIMIZE_TIME("qot", "Query optimize time in nanoseconds", LogLevel.OFF, PLong.INSTANCE),
+    QUERY_RESULT_SET_TIME("qrt", "Query result set creation time in nanoseconds", LogLevel.OFF, PLong.INSTANCE),
     QUERY_TIMEOUT_COUNTER("qo", "Number of times query timed out",LogLevel.DEBUG, PLong.INSTANCE),
     QUERY_FAILED_COUNTER("qf", "Number of times query failed",LogLevel.DEBUG, PLong.INSTANCE),
     NUM_PARALLEL_SCANS("ps", "Number of scans that were executed in parallel",LogLevel.DEBUG, PLong.INSTANCE),
