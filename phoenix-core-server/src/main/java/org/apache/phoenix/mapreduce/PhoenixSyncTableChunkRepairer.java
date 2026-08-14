@@ -30,11 +30,8 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.NavigableMap;
 import java.util.Set;
-import java.util.TreeMap;
 import org.apache.hadoop.hbase.Cell;
-import org.apache.hadoop.hbase.CellComparator;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Put;
@@ -62,12 +59,20 @@ import org.slf4j.LoggerFactory;
  * <p>
  * Merge-scan contract: both scanners return rows in ascending key order (HBase guarantee).
  * <ul>
- * <li>{@code cmp == 0} (same row): compare cells; repair only differing cells.</li>
+ * <li>{@code cmp == 0} (same row): {@code (family, ts)}-grouped diff (see
+ * {@link #generateMutationForDiffCells}); emits {@link Delete#addFamilyVersion} for target-only
+ * whole slices, cell-level mutations for same-slice content drift.</li>
  * <li>{@code cmp <  0} (source-only): mirror all source cells onto target.</li>
  * <li>{@code cmp >  0} (target-only): tombstone target cells within
- * {@code [fromTime, toTime]}.</li>
+ * {@code [fromTime, toTime)} with {@code DeleteFamilyVersion} per {@code (cf, ts)}.</li>
  * </ul>
- * Cells outside {@code [fromTime, toTime]} are never read (scan time range), so never mutated.
+ * Cells outside {@code [fromTime, toTime)} are never read (scan time range), so never mutated.
+ * <p>
+ * Repair scan on <b>target</b> is forced {@code raw=true} + {@code readAllVersions()} regardless
+ * of user flags so hidden (max-versions-filtered) target versions and target tombstone cells
+ * surface directly in the merge walk. Repair scan on <b>source</b> continues to honor the user's
+ * {@code --raw-scan} / {@code --read-all-versions} flags so the mirrored source view matches what
+ * the verifier hashed.
  * <p>
  * Tombstone semantics: HBase has four tombstone subtypes ({@code Delete}, {@code DeleteColumn},
  * {@code DeleteFamily}, {@code DeleteFamilyVersion}). Source Puts we mirror onto target may be
@@ -127,9 +132,10 @@ public final class PhoenixSyncTableChunkRepairer {
     Scan sourceScan;
     Scan targetScan;
     try {
-      sourceScan = createRepairScan(req.sourceStart, req.sourceEnd, true, true, sourcePhoenixConn);
+      sourceScan =
+        createRepairScan(req.sourceStart, req.sourceEnd, true, true, false, sourcePhoenixConn);
       targetScan = createRepairScan(req.targetStart, req.targetEnd, req.targetStartInclusive,
-        req.targetEndInclusive, targetPhoenixConn);
+        req.targetEndInclusive, true, targetPhoenixConn);
     } catch (IOException e) {
       LOGGER.error("Repair failed to build scans for chunk source=[{}, {}] on table {}: {}",
         Bytes.toStringBinary(req.sourceStart), Bytes.toStringBinary(req.sourceEnd), tableName,
@@ -205,12 +211,14 @@ public final class PhoenixSyncTableChunkRepairer {
    * each time the batch reaches {@link #repairBatchSize}, and finally draining the tail. Per
    * branch:
    * <ul>
-   * <li>{@code cmp == 0} — diff cells; record cell-level drift and any row-unrepairable flag.</li>
+   * <li>{@code cmp == 0} — {@code (family, ts)}-grouped diff (see
+   * {@link #generateMutationForDiffCells}); record cell-level drift and any row-unrepairable
+   * flag.</li>
    * <li>{@code cmp <  0} — mirror the source row onto target; bump {@code rowsMissing} unless the
    * whole row was shadowed, and {@code rowsCannotRepair} unless every cell was mirrored.</li>
-   * <li>{@code cmp >  0} — tombstone the extra row on target; bump {@code rowsExtra} when at least
-   * one live cell was tombstoned, else {@code rowsCannotRepair} (row was already all
-   * tombstones).</li>
+   * <li>{@code cmp >  0} — tombstone the extra row on target with per-{@code (cf, ts)}
+   * {@code DeleteFamilyVersion}; bump {@code rowsExtra} when at least one live cell was
+   * tombstoned, else {@code rowsCannotRepair} (row was already all tombstones).</li>
    * </ul>
    */
   private void repairDiffRows(ResultScanner sourceScanner, ResultScanner targetScanner,
@@ -254,7 +262,7 @@ public final class PhoenixSyncTableChunkRepairer {
       } else {
         byte[] extraRowKey = targetResult.getRow();
         int liveCellsTombstoned =
-          tombstoneWholeRow(targetResult, targetHTable, pendingPuts, pendingDeletes);
+          tombstoneWholeRow(targetResult, pendingPuts, pendingDeletes);
         if (liveCellsTombstoned == 0) {
           drift.rowsCannotRepair++;
         } else {
@@ -305,8 +313,13 @@ public final class PhoenixSyncTableChunkRepairer {
   }
 
   /**
-   * Mirrors every source cell of a row that is missing on target. Each cell is shadow-checked
-   * against target's per-row record (see {@link TargetRowRecord}).
+   * Mirrors every source cell of a row that is missing on target. Iterates cell-by-cell (not one
+   * whole-row {@link Put}) so each cell can be shadow-checked against target's tombstones via
+   * {@link TargetRowRecord} — a Put shadowed by an existing target tombstone would land on disk
+   * invisible to reads, silently faking a {@code REPAIRED} chunk. Suppressed mirrors flip the row
+   * to {@code PARTIALLY_MIRRORED} / {@code FULLY_SHADOWED} so the chunk resolves as
+   * {@code UNREPAIRABLE}. Per-cell iteration also lets {@code --raw-scan} tombstone cells route
+   * through {@link Delete#add(Cell)}, which {@link Put#add(Cell)} would reject.
    */
   private RowMirrorStatus mirrorWholeRow(Result sourceResult, Table targetHTable,
     List<Put> pendingPuts, List<Delete> pendingDeletes) throws IOException {
@@ -327,118 +340,143 @@ public final class PhoenixSyncTableChunkRepairer {
   }
 
   /**
-   * Tombstones every live cell of a row that is extra on target. Skips cells that are themselves
-   * already tombstones (see {@link #tombstoneTargetCell}).
+   * Tombstones every live cell of a row that is extra on target by emitting one
+   * {@link Delete#addFamilyVersion} per distinct {@code (family, ts)} observed. Skips cells that
+   * are themselves already tombstones.
+   * <p>
+   * {@code DeleteFamilyVersion} shadows every Put at {@code (cf, *, ts == T)} exactly, so it never
+   * reaches cells outside {@code [fromTime, toTime)} — the scan already time-bounded them.
    * @return the number of live cells that contributed a tombstone marker. {@code 0} means the row
    *         was already entirely tombstones; the caller records this as {@code ROWS_CANNOT_REPAIR}.
    */
-  private int tombstoneWholeRow(Result targetResult, Table targetHTable, List<Put> pendingPuts,
-    List<Delete> pendingDeletes) throws IOException {
+  private int tombstoneWholeRow(Result targetResult, List<Put> pendingPuts,
+    List<Delete> pendingDeletes) {
     RowRepairBuffer rowRepairBuffer = new RowRepairBuffer(targetResult.getRow());
-    // Empty source map drives every target cell into tombstoneTargetCell's "no source column"
-    // branch (DeleteColumn at ts <= T).
-    Map<ColumnKey, Long> sourceMaxTsByColumn = Collections.emptyMap();
+    Set<CfTsKey> tombstoned = new HashSet<>();
     int liveCellsTombstoned = 0;
     for (Cell cell : targetResult.rawCells()) {
-      if (tombstoneTargetCell(cell, targetHTable, rowRepairBuffer, sourceMaxTsByColumn)) {
-        liveCellsTombstoned++;
+      if (CellUtil.isDelete(cell)) {
+        continue;
       }
+      CfTsKey key = CfTsKey.of(cell);
+      if (tombstoned.add(key)) {
+        rowRepairBuffer.delete().addFamilyVersion(key.family, key.ts);
+      }
+      liveCellsTombstoned++;
     }
     rowRepairBuffer.flush(pendingPuts, pendingDeletes);
     return liveCellsTombstoned;
   }
 
   /**
-   * Diffs cells of two rows present on both clusters in lock-step using {@link CellComparator}
-   * order and emits {@link Put}/{@link Delete} mutations.
-   * <p>
-   * Branches:
+   * Diffs cells of two rows present on both clusters by grouping Put cells on both sides by
+   * {@code (family, ts)}, then classifying each group:
    * <ul>
-   * <li>same coords + matching value → no drift</li>
-   * <li>same coords + different value → different++; mirror source cell (shadow-checked)</li>
-   * <li>source-only cell → missing++; mirror source cell (shadow-checked)</li>
-   * <li>target-only live cell → extra++; tombstone target cell</li>
-   * <li>target-only tombstone cell → skip; row carries unrepairable drift</li>
+   * <li><b>target-only {@code (cf, ts)}</b> → one {@link Delete#addFamilyVersion}; wipes the whole
+   * slice in one marker regardless of qualifier count. Bumps {@code cellExtra} by group size.</li>
+   * <li><b>source-only {@code (cf, ts)}</b> → mirror each source cell (shadow-checked). Bumps
+   * {@code cellMissing} per mirrored cell.</li>
+   * <li><b>same {@code (cf, ts)}, different content</b> → qualifier-level diff within the group:
+   *   <ul>
+   *   <li>source-only qualifier → mirror (shadow-checked); {@code cellMissing++}.</li>
+   *   <li>same qualifier, different value → mirror source cell; {@code cellDifferent++}. HBase
+   *   uses the later-written cell at same {@code (cf, q, ts)}, so a plain Put wins with no
+   *   companion delete needed.</li>
+   *   <li>target-only qualifier → point-{@link Delete#addColumn} at exact ts; {@code cellExtra++}.
+   *   Cannot emit {@code DeleteFamilyVersion(cf, ts)} here — it would shadow our own same-ts
+   *   mirrored Puts in the same batch.</li>
+   *   </ul>
+   * </li>
    * </ul>
-   * Mirrors suppressed by shadowing do NOT bump the cell counter (nothing was written); the
-   * row-level signal flows through {@link RowDriftInfo#rowCannotRepair}.
+   * Source tombstones bypass the group diff and mirror as-is (subtype preserved). Mirrors
+   * suppressed by shadowing do NOT bump the cell counter (nothing was written); the row-level
+   * signal flows through {@link RowDriftInfo#rowCannotRepair}.
+   * <p>
+   * Target's raw+all-versions scan surfaces hidden (max-versions-filtered) Puts directly in
+   * {@code targetResult.rawCells()}, so their timestamps appear as their own target-only
+   * {@code (cf, ts)} groups and get {@code DeleteFamilyVersion}'d without any separate hidden-
+   * version-discovery RPC.
    */
   private RowDriftInfo generateMutationForDiffCells(Result sourceResult, Result targetResult,
     Table targetHTable, List<Put> pendingPuts, List<Delete> pendingDeletes) throws IOException {
     Cell[] sourceCells = sourceResult.rawCells();
     Cell[] targetCells = targetResult.rawCells();
-    CellComparator comparator = CellComparator.getInstance();
     RowRepairBuffer rowRepairBuffer = new RowRepairBuffer(sourceResult.getRow());
 
-    // Per-column max source PUT timestamp; consumed by tombstoneTargetCell to pick the
-    // delete shape for a target-extra cell — see its javadoc for the three cases.
-    // Math::max collapses source's multi-version cells into a single Long per column so
-    // the comparison against target's ts is a scalar check.
-    //
-    // Example: source has Put(NAME)@300 and Put(NAME)@200 → sourceMaxTsByColumn[NAME]=300.
-    Map<ColumnKey, Long> sourceMaxTsByColumn = new HashMap<>();
-    for (Cell sourceCell : sourceCells) {
-      if (!CellUtil.isDelete(sourceCell)) {
-        sourceMaxTsByColumn.merge(ColumnKey.of(sourceCell), sourceCell.getTimestamp(), Math::max);
+    Map<CfTsKey, Map<ColumnKey, Cell>> srcPutsByCfTs = new HashMap<>();
+    Map<CfTsKey, Map<ColumnKey, Cell>> tgtPutsByCfTs = new HashMap<>();
+    List<Cell> srcTombstones = new ArrayList<>();
+
+    for (Cell c : sourceCells) {
+      if (CellUtil.isDelete(c)) {
+        srcTombstones.add(c);
+      } else {
+        srcPutsByCfTs.computeIfAbsent(CfTsKey.of(c), k -> new HashMap<>()).put(ColumnKey.of(c), c);
       }
+    }
+    for (Cell c : targetCells) {
+      if (!CellUtil.isDelete(c)) {
+        tgtPutsByCfTs.computeIfAbsent(CfTsKey.of(c), k -> new HashMap<>()).put(ColumnKey.of(c), c);
+      }
+    }
+
+    // Mirror source tombstones directly; subtype preserved via Delete.add(Cell). Source tombstones
+    // can't be shadowed by target tombstones (only source Puts can), so no shadow-check here.
+    for (Cell tomb : srcTombstones) {
+      rowRepairBuffer.delete().add(tomb);
     }
 
     int cellMissing = 0;
     int cellExtra = 0;
     int cellDifferent = 0;
 
-    int sourceIdx = 0;
-    int targetIdx = 0;
-    while (sourceIdx < sourceCells.length && targetIdx < targetCells.length) {
-      int cmp = comparator.compare(sourceCells[sourceIdx], targetCells[targetIdx]);
-      if (cmp == 0) {
-        // Same coordinates, compare values.
-        if (!CellUtil.matchingValue(sourceCells[sourceIdx], targetCells[targetIdx])) {
-          if (
-            mirrorSourceCellUnlessShadowed(sourceCells[sourceIdx], targetHTable, rowRepairBuffer)
-          ) {
-            cellDifferent++;
+    Set<CfTsKey> allKeys = new HashSet<>(srcPutsByCfTs.keySet());
+    allKeys.addAll(tgtPutsByCfTs.keySet());
+
+    for (CfTsKey key : allKeys) {
+      Map<ColumnKey, Cell> srcGroup = srcPutsByCfTs.getOrDefault(key, Collections.emptyMap());
+      Map<ColumnKey, Cell> tgtGroup = tgtPutsByCfTs.getOrDefault(key, Collections.emptyMap());
+
+      if (srcGroup.isEmpty()) {
+        // Target-only (cf, ts): one marker wipes the whole slice.
+        rowRepairBuffer.delete().addFamilyVersion(key.family, key.ts);
+        cellExtra += tgtGroup.size();
+      } else if (tgtGroup.isEmpty()) {
+        // Source-only (cf, ts): mirror each source cell (shadow-checked).
+        for (Cell c : srcGroup.values()) {
+          if (mirrorSourceCellUnlessShadowed(c, targetHTable, rowRepairBuffer)) {
+            cellMissing++;
           }
         }
-        sourceIdx++;
-        targetIdx++;
-      } else if (cmp < 0) {
-        // Missing on target
-        if (mirrorSourceCellUnlessShadowed(sourceCells[sourceIdx], targetHTable, rowRepairBuffer)) {
-          cellMissing++;
-        }
-        sourceIdx++;
       } else {
-        // extra on target
-        if (
-          tombstoneTargetCell(targetCells[targetIdx++], targetHTable, rowRepairBuffer,
-            sourceMaxTsByColumn)
-        ) {
-          cellExtra++;
-        } else {
-          rowRepairBuffer.anyCellUnrepairable = true;
+        // Same (cf, ts) different content: qualifier-level diff. Cannot use DeleteFamilyVersion
+        // here — it would shadow our own same-ts Puts in the same batch.
+        for (Map.Entry<ColumnKey, Cell> srcEntry : srcGroup.entrySet()) {
+          Cell tgtCell = tgtGroup.get(srcEntry.getKey());
+          Cell srcCell = srcEntry.getValue();
+          if (tgtCell == null) {
+            if (mirrorSourceCellUnlessShadowed(srcCell, targetHTable, rowRepairBuffer)) {
+              cellMissing++;
+            }
+          } else if (!CellUtil.matchingValue(srcCell, tgtCell)) {
+            if (mirrorSourceCellUnlessShadowed(srcCell, targetHTable, rowRepairBuffer)) {
+              cellDifferent++;
+            }
+          }
         }
-      }
-    }
-    while (sourceIdx < sourceCells.length) {
-      if (mirrorSourceCellUnlessShadowed(sourceCells[sourceIdx], targetHTable, rowRepairBuffer)) {
-        cellMissing++;
-      }
-      sourceIdx++;
-    }
-    while (targetIdx < targetCells.length) {
-      if (
-        tombstoneTargetCell(targetCells[targetIdx++], targetHTable, rowRepairBuffer,
-          sourceMaxTsByColumn)
-      ) {
-        cellExtra++;
-      } else {
-        rowRepairBuffer.anyCellUnrepairable = true;
+        for (Map.Entry<ColumnKey, Cell> tgtEntry : tgtGroup.entrySet()) {
+          if (!srcGroup.containsKey(tgtEntry.getKey())) {
+            Cell c = tgtEntry.getValue();
+            rowRepairBuffer.delete().addColumn(CellUtil.cloneFamily(c),
+              CellUtil.cloneQualifier(c), c.getTimestamp());
+            cellExtra++;
+          }
+        }
       }
     }
 
     if (
-      cellMissing == 0 && cellExtra == 0 && cellDifferent == 0
+      cellMissing == 0 && cellExtra == 0 && cellDifferent == 0 && srcTombstones.isEmpty()
         && !rowRepairBuffer.anyCellUnrepairable
     ) {
       return RowDriftInfo.NONE;
@@ -485,86 +523,29 @@ public final class PhoenixSyncTableChunkRepairer {
   }
 
   /**
-   * Tombstones a target-only cell to make target's read view at this column match source's. Skips
-   * cells that are themselves already tombstones.
+   * Builds a row-level HBase scan for repair.
    * <p>
-   * Called only when source has no cell at this target cell's exact {@code (cf, q, ts)}. If source
-   * does have a cell at the same {@code (cf, q, ts)}, the caller takes the mirroring path instead
+   * {@code forceRawAllVersions=true} (used for the target repair scan) sets {@code raw=true} and
+   * {@code readAllVersions()} unconditionally so tombstone cells and hidden (max-versions-filtered)
+   * Puts surface directly in the merge walk — the ts-grouped diff turns hidden target versions
+   * into their own target-only {@code (cf, ts)} groups that get {@code DeleteFamilyVersion}'d
+   * without a separate hidden-version-discovery RPC.
    * <p>
-   * Tombstone subtype depends on what source has at this {@code (cf, q)}. Examples assume
-   * {@code MAX_VERSIONS=3} and show only the relevant column.
+   * {@code forceRawAllVersions=false} (used for the source repair scan) honors the user's
+   * {@code --raw-scan} and {@code --read-all-versions} flags so the mirrored source view matches
+   * the cells the verifier hashed.
    * <p>
-   * <b>Case 1 — Source has no cell at this column:</b>
-   *
-   * <pre>
-   *   source row: (no NAME)
-   *   target row: Put(NAME, "carol")@900 visible
-   *               Put(NAME, "bob")  @600 hidden
-   *   action    : DeleteColumn(NAME)@900   (covers ts <= 900, wipes "bob" too)
-   *   result    : target reads no NAME — matches source.
-   * </pre>
-   * <p>
-   * <b>Case 2 — {@code sourceMaxTs >= targetTs}:</b>
-   *
-   * <pre>
-   *   source row: Put(NAME, "alice")@500       (sourceMaxTs = 500)
-   *   target row: Put(NAME, "old",  )@200      (input cell; source has nothing at @200)
-   *   action    : point-Delete(NAME)@200
-   *   result    : "old"@200 is shadowed;
-   *              Put(NAME, "alice")@500 would already have been mirrored
-   * </pre>
-   * <p>
-   * <b>Case 3 — {@code sourceMaxTs < targetTs}:</b>
-   *
-   * <pre>
-   *   source row: Put(NAME, "alice")@300       (sourceMaxTs = 300)
-   *   target row: Put(NAME, "carol")@900 visible
-   *               Put(NAME, "bob")  @600 hidden
-   *               Put(NAME, "alice")@300 hidden
-   *   action    : point-Delete(NAME)@900 + point-Delete(NAME)@600
-   *               (without the second, "bob"@600 surfaces above source's mirror)
-   *   result    : target's "alice"@300 is the highest live version — matches source.
-   * </pre>
-   *
-   * @return true if the cell was a live cell that contributed a tombstone marker, false if the cell
-   *         was already a tombstone and was skipped.
-   */
-  private boolean tombstoneTargetCell(Cell cell, Table targetHTable,
-    RowRepairBuffer rowRepairBuffer, Map<ColumnKey, Long> sourceMaxTsByColumn) throws IOException {
-    if (CellUtil.isDelete(cell)) {
-      return false;
-    }
-    byte[] family = CellUtil.cloneFamily(cell);
-    byte[] qualifier = CellUtil.cloneQualifier(cell);
-    long ts = cell.getTimestamp();
-    Long sourceMaxTs = sourceMaxTsByColumn.get(new ColumnKey(family, qualifier));
-    if (sourceMaxTs == null) {
-      rowRepairBuffer.delete().addColumns(family, qualifier, ts);
-    } else if (sourceMaxTs >= ts) {
-      rowRepairBuffer.delete().addColumn(family, qualifier, ts);
-    } else {
-      rowRepairBuffer.delete().addColumn(family, qualifier, ts);
-      Set<Long> hiddenTs = rowRepairBuffer.targetRowRecord(targetHTable)
-        .targetPutTimestampsBetween(family, qualifier, sourceMaxTs, ts);
-      for (Long hidden : hiddenTs) {
-        rowRepairBuffer.delete().addColumn(family, qualifier, hidden);
-      }
-    }
-    return true;
-  }
-
-  /**
-   * Builds a row-level HBase scan for repair. Honors the user's {@code --raw-scan} and
-   * {@code --read-all-versions} flags; adds bulk caching plus Phoenix TTL / {@code IS_STRICT_TTL}
-   * attributes so the cells visited here are the same cells the verifier hashed.
+   * Adds bulk caching plus Phoenix TTL / {@code IS_STRICT_TTL} attributes so the cells visited
+   * here are the same cells the verifier hashed.
    */
   private Scan createRepairScan(byte[] startKey, byte[] endKey, boolean isStartKeyInclusive,
-    boolean isEndKeyInclusive, PhoenixConnection phoenixConn) throws IOException, SQLException {
+    boolean isEndKeyInclusive, boolean forceRawAllVersions, PhoenixConnection phoenixConn)
+    throws IOException, SQLException {
     Scan scan = new Scan();
     scan.withStartRow(startKey, isStartKeyInclusive);
     scan.withStopRow(endKey, isEndKeyInclusive);
-    scan.setRaw(isRawScan);
-    if (isReadAllVersions) {
+    scan.setRaw(forceRawAllVersions || isRawScan);
+    if (forceRawAllVersions || isReadAllVersions) {
       scan.readAllVersions();
     }
     scan.setCacheBlocks(false);
@@ -736,10 +717,12 @@ public final class PhoenixSyncTableChunkRepairer {
   }
 
   /**
-   * Per-row snapshot of target's tombstones and Puts. Two queries: {@link #wouldShadow} (shadow
-   * detection) and {@link #targetPutTimestampsBetween} (hidden-version discovery). For examples of
-   * how callers use these, see the doc on {@link RowRepairBuffer#targetRowRecord}; for scan shape
-   * and time-range rationale, see {@link #load}.
+   * Per-row snapshot of target's tombstones used by {@link #wouldShadow} for shadow detection
+   * before mirroring a source Put.
+   * <p>
+   * Hidden-Put discovery is now handled inline by the {@code (cf, ts)}-grouped diff in
+   * {@link #generateMutationForDiffCells} using target's raw+all-versions scan cells directly, so
+   * this record no longer indexes target Puts — only tombstones.
    * <p>
    * HBase has four tombstone subtypes; each is recorded into its own map because shadow scope
    * differs:
@@ -756,14 +739,12 @@ public final class PhoenixSyncTableChunkRepairer {
     private final Map<ColumnKey, Long> deleteColumnUpperBound = new HashMap<>();
     private final Map<ByteBuffer, Long> deleteFamilyUpperBound = new HashMap<>();
     private final Map<ByteBuffer, Set<Long>> deleteFamilyVersionTs = new HashMap<>();
-    /** Per-column ts-ordered set of target's Put timestamps. */
-    private final Map<ColumnKey, NavigableMap<Long, Boolean>> targetPutTs = new HashMap<>();
 
     /**
      * Builds a {@link TargetRowRecord} from a single-row HBase scan.
      * <p>
-     * <b>raw=true + all-versions</b> are forced regardless of user flags so tombstones and
-     * max-versions-filtered older Puts (the two things this record exists to capture) are surfaced.
+     * <b>raw=true + all-versions</b> are forced regardless of user flags so tombstones (the only
+     * thing this record now captures) are surfaced.
      * <p>
      * <b>Time range {@code [fromTime, MAX_VALUE]}</b>:
      * <ul>
@@ -791,20 +772,13 @@ public final class PhoenixSyncTableChunkRepairer {
         Result raw = scanner.next();
         if (raw != null) {
           for (Cell cell : raw.rawCells()) {
-            rowRecord.record(cell);
+            if (CellUtil.isDelete(cell)) {
+              rowRecord.recordTombstone(cell);
+            }
           }
         }
       }
       return rowRecord;
-    }
-
-    void record(Cell cell) {
-      if (CellUtil.isDelete(cell)) {
-        recordTombstone(cell);
-      } else {
-        targetPutTs.computeIfAbsent(ColumnKey.of(cell), k -> new TreeMap<>())
-          .put(cell.getTimestamp(), Boolean.TRUE);
-      }
     }
 
     /**
@@ -858,21 +832,6 @@ public final class PhoenixSyncTableChunkRepairer {
       Set<Long> dfvTs = deleteFamilyVersionTs.get(family);
       return dfvTs != null && dfvTs.contains(ts);
     }
-
-    /**
-     * Returns target's Put timestamps at {@code (cf, q)} that are strictly greater than
-     * {@code lowerExclusive} and strictly less than {@code upperExclusive}. Used to find hidden
-     * (max-versions-filtered) target versions sitting between source's max ts and target's visible
-     * ts so they can be point-Deleted.
-     */
-    Set<Long> targetPutTimestampsBetween(byte[] family, byte[] qualifier, long lowerExclusive,
-      long upperExclusive) {
-      NavigableMap<Long, Boolean> putTimestamps = targetPutTs.get(new ColumnKey(family, qualifier));
-      if (putTimestamps == null) {
-        return Collections.emptySet();
-      }
-      return putTimestamps.subMap(lowerExclusive, false, upperExclusive, false).keySet();
-    }
   }
 
   /** Composite (family, qualifier) key with byte-array equality semantics. */
@@ -901,6 +860,38 @@ public final class PhoenixSyncTableChunkRepairer {
     @Override
     public int hashCode() {
       return Bytes.hashCode(family) * 31 + Bytes.hashCode(qualifier);
+    }
+  }
+
+  /**
+   * Composite (family, timestamp) key used to bucket Put cells for the {@code (cf, ts)}-grouped
+   * diff in {@link #generateMutationForDiffCells}. Byte-array equality on family.
+   */
+  static final class CfTsKey {
+    final byte[] family;
+    final long ts;
+
+    CfTsKey(byte[] family, long ts) {
+      this.family = family;
+      this.ts = ts;
+    }
+
+    static CfTsKey of(Cell cell) {
+      return new CfTsKey(CellUtil.cloneFamily(cell), cell.getTimestamp());
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (!(o instanceof CfTsKey)) {
+        return false;
+      }
+      CfTsKey other = (CfTsKey) o;
+      return ts == other.ts && Bytes.equals(family, other.family);
+    }
+
+    @Override
+    public int hashCode() {
+      return Bytes.hashCode(family) * 31 + Long.hashCode(ts);
     }
   }
 
@@ -937,11 +928,9 @@ public final class PhoenixSyncTableChunkRepairer {
      * Returns the cached {@link TargetRowRecord} for this row, loading on first call via
      * {@link TargetRowRecord#load} (one raw all-versions scan, time range
      * {@code [fromTime, MAX_VALUE]}). Cache scope is the buffer's lifetime — i.e. the current row —
-     * so repeated cell-level lookups within the row pay one round-trip total.
+     * so repeated cell-level shadow checks within the row pay one round-trip total.
      * <p>
-     * Two consumers:
-     * <p>
-     * <b>Shadow detection</b> — {@link #mirrorSourceCellUnlessShadowed} asks
+     * Consumed by {@link #mirrorSourceCellUnlessShadowed}, which asks
      * {@link TargetRowRecord#wouldShadow} before mirroring a source Put, to skip writes that
      * target's existing tombstones would render invisible.
      *
@@ -950,22 +939,6 @@ public final class PhoenixSyncTableChunkRepairer {
      *   source row state: Put(NAME, "alice")@T=500
      *   wouldShadow(srcPut@500) → true
      *   ⇒ skip mirror, mark row unrepairable; operator must major-compact target
-     * </pre>
-     * <p>
-     * <b>Hidden-version discovery</b> — {@link #tombstoneTargetCell} asks
-     * {@link TargetRowRecord#targetPutTimestampsBetween} for max-versions-filtered Puts sitting
-     * between source's max ts and target's visible ts, so each can be point-Deleted before they
-     * surface above source's mirror.
-     *
-     * <pre>
-     *   target row state (MAX_VERSIONS=3):
-     *     Put(NAME, "carol")@T=900   visible
-     *     Put(NAME, "bob")  @T=600   hidden
-     *     Put(NAME, "alice")@T=300   hidden
-     *   source row state:
-     *     Put(NAME, "alice")@T=300   (sourceMaxTs=300)
-     *   targetPutTimestampsBetween(NAME, 300, 900) → {600}
-     *     point-Delete T=900 (visible) and T=600 (hidden) so T=300 surfaces
      * </pre>
      */
     TargetRowRecord targetRowRecord(Table targetHTable) throws IOException {

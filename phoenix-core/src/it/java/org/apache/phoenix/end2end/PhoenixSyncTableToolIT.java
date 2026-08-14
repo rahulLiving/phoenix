@@ -35,11 +35,14 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
@@ -76,7 +79,10 @@ import org.apache.phoenix.mapreduce.PhoenixSyncTableOutputRepository;
 import org.apache.phoenix.mapreduce.PhoenixSyncTableTool;
 import org.apache.phoenix.query.BaseTest;
 import org.apache.phoenix.query.QueryServices;
+import org.apache.phoenix.schema.PTable;
+import org.apache.phoenix.schema.PTableType;
 import org.apache.phoenix.schema.types.PInteger;
+import org.apache.phoenix.util.MetaDataUtil;
 import org.apache.phoenix.util.PhoenixRuntime;
 import org.apache.phoenix.util.TestUtil;
 import org.junit.After;
@@ -445,6 +451,225 @@ public class PhoenixSyncTableToolIT {
 
     assertFalse("Should have checkpoint entries for local index", checkpointEntries.isEmpty());
     validateCheckpointEntries(indexName, null, counters, repairCounters);
+  }
+
+  /**
+   * Verifies {@link PhoenixSyncTableTool} can be pointed at a logical view-index name. View indexes
+   * are {@link PTableType#INDEX} metadata whose physical table is the shared {@code _IDX_&lt;base&gt;}
+   * HBase table. Today the tool accepts the logical index name and syncs that physical table (no
+   * per-viewIndexId prefix filter yet).
+   */
+  @Test
+  public void testSyncViewIndexTable() throws Exception {
+    createTableOnBothClusters(sourceConnection, targetConnection, uniqueTableName);
+
+    String viewName = uniqueTableName + "_V";
+    String viewIndexName = uniqueTableName + "_V_IDX";
+    createViewOnBothClusters(sourceConnection, targetConnection, viewName, uniqueTableName);
+    createViewIndexOnBothClusters(sourceConnection, targetConnection, viewName, viewIndexName);
+
+    PTable viewIndexTable =
+      sourceConnection.unwrap(PhoenixConnection.class).getTable(viewIndexName);
+    assertEquals("View index should be INDEX type", PTableType.INDEX, viewIndexTable.getType());
+    assertNotNull("View index must have a viewIndexId", viewIndexTable.getViewIndexId());
+    String physicalViewIndexTable = viewIndexTable.getPhysicalName().getString();
+    assertTrue("Physical name should be the shared _IDX_ table: " + physicalViewIndexTable,
+      MetaDataUtil.isViewIndex(physicalViewIndexTable));
+    assertEquals(MetaDataUtil.getViewIndexPhysicalName(uniqueTableName), physicalViewIndexTable);
+
+    insertTestData(sourceConnection, uniqueTableName, 1, 10);
+    waitForReplication(targetConnection, uniqueTableName, 10);
+    waitForIndexRowCount(targetConnection, viewIndexName, 10);
+    verifyDataIdentical(sourceConnection, targetConnection, uniqueTableName);
+
+    // Inject drift only on the shared physical view-index table (not the data table).
+    deleteHBaseRows(CLUSTERS.getHBaseCluster2(), physicalViewIndexTable, 3);
+
+    RepairRunResult result = runSyncToolWithRepair(viewIndexName);
+    SyncCountersResult counters = getSyncCounters(result.dryRunJob);
+    SyncCountersResult repairCounters = getSyncCounters(result.repairJob);
+
+    assertTrue("Dry-run should process source view-index rows, actual: " + counters.sourceRowsProcessed,
+      counters.sourceRowsProcessed >= 1);
+    assertTrue("Dry-run should detect mismatched chunks on view index, actual: "
+      + counters.chunksMismatched, counters.chunksMismatched >= 1);
+    assertTrue("Dry-run should report rows missing on target, actual: " + counters.rowsMissingOnTarget,
+      counters.rowsMissingOnTarget >= 1);
+
+    List<PhoenixSyncTableCheckpointOutputRow> checkpointEntries =
+      queryCheckpointTable(sourceConnection, viewIndexName, targetZkQuorum, null);
+    assertFalse("Should have checkpoint entries for view index", checkpointEntries.isEmpty());
+    validateCheckpointEntries(viewIndexName, null, counters, repairCounters);
+  }
+
+  /**
+   * Proves that when {@link PhoenixSyncTableTool} is asked to sync {@code SYSTEM.CATALOG} or
+   * {@code SYSTEM.CHILD_LINK} with {@code --tenant-id T}, every scan it issues against the
+   * metadata table is prefix-scoped to {@code T} (or to global rows where {@code TENANT_ID} is
+   * empty). Both metadata tables have {@code (TENANT_ID, TABLE_SCHEM, TABLE_NAME, COLUMN_NAME,
+   * COLUMN_FAMILY)} as their primary key, so the leading bytes of any scan's start row is the
+   * tenant identity.
+   * <p>
+   * A {@link TenantIdRecordingObserver} attached to each SYSTEM table records the tenant prefix
+   * of every {@link Scan#getStartRow()}. This is a property of the scans the tool issues, not of
+   * the rows returned, so no tenant-keyed data needs to be seeded for the assertion to be
+   * meaningful. After running the tool with
+   * {@code --schema SYSTEM --table-name CATALOG --tenant-id TENANT_A}, the recorded prefix set
+   * for SYSTEM.CATALOG must be a subset of {@code {"TENANT_A", ""}} and never contain
+   * {@code TENANT_B}; the SYSTEM.CHILD_LINK run gives the same guarantee for that table.
+   */
+  @Test
+  public void testSyncToolReadsTenantScopedSystemCatalogAndChildLink() throws Exception {
+    // 15-byte tenant IDs so lexicographic ordering matches the string ordering and no other
+    // SYSTEM.CATALOG rows (empty tenant / global schema entries) land inside the tenant-scoped
+    // ranges. Real Salesforce tenant ids are also 15 chars.
+    final String tenantA = "000000000TENANTA";
+    final String tenantB = "000000000TENANTB";
+
+    final String sysCatalog = org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME;
+    final String sysChildLink =
+      org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME;
+
+    // Seed multi-tenant SYSTEM.CATALOG rows: create a base MULTI_TENANT table, then create a view
+    // under each tenant. Each CREATE VIEW inserts a TABLE row keyed by (tenantId, ...) into
+    // SYSTEM.CATALOG and a parent->child link row into SYSTEM.CHILD_LINK.
+    String baseTable = "TBL_" + BaseTest.generateUniqueName();
+    try (Statement stmt = sourceConnection.createStatement()) {
+      stmt.execute("CREATE TABLE " + baseTable
+        + " (TENANT_ID VARCHAR NOT NULL, ID INTEGER NOT NULL, V VARCHAR "
+        + "CONSTRAINT PK PRIMARY KEY (TENANT_ID, ID)) MULTI_TENANT=true");
+    }
+    try (Connection tA = getTenantConnection(sourceConnection, tenantA);
+      Statement s = tA.createStatement()) {
+      s.execute("CREATE VIEW " + baseTable + "_V_A AS SELECT * FROM " + baseTable);
+    }
+    try (Connection tB = getTenantConnection(sourceConnection, tenantB);
+      Statement s = tB.createStatement()) {
+      s.execute("CREATE VIEW " + baseTable + "_V_B AS SELECT * FROM " + baseTable);
+    }
+
+    // Pre-split SYSTEM.CATALOG at TENANT_B so TENANT_A rows and TENANT_B rows live in distinct
+    // regions. If the tool honors --tenant-id at the split level, we expect it to scan only the
+    // [∅, tenantB) region for --tenant-id=TENANT_A.
+    byte[] catalogSplitKey = Bytes.toBytes(tenantB);
+    byte[] childLinkSplitKey = Bytes.toBytes(tenantB);
+    try (Admin admin =
+      sourceConnection.unwrap(PhoenixConnection.class).getQueryServices().getAdmin()) {
+      splitAndWait(admin, TableName.valueOf(sysCatalog), catalogSplitKey);
+      splitAndWait(admin, TableName.valueOf(sysChildLink), childLinkSplitKey);
+      logRegions(admin, sysCatalog);
+      logRegions(admin, sysChildLink);
+    }
+
+    TestUtil.addCoprocessor(sourceConnection, sysCatalog, TenantIdRecordingObserver.class);
+    TestUtil.addCoprocessor(sourceConnection, sysChildLink, TenantIdRecordingObserver.class);
+    try {
+      // Sync SYSTEM.CATALOG with --tenant-id TENANT_A. Dry-run is sufficient: the goal here is to
+      // observe what the tool scans, not to write back mutations to SYSTEM tables.
+      TenantIdRecordingObserver.reset();
+      Job catalogJob = runSyncTool("CATALOG", "--schema", "SYSTEM", "--tenant-id", tenantA,
+        "--dry-run");
+      assertTrue("SYSTEM.CATALOG sync must succeed", catalogJob.isSuccessful());
+      assertScanRangesAreTenantBounded(sysCatalog, tenantA, tenantB);
+
+      // Sync SYSTEM.CHILD_LINK with --tenant-id TENANT_A. Same shape as above.
+      TenantIdRecordingObserver.reset();
+      Job childLinkJob = runSyncTool("CHILD_LINK", "--schema", "SYSTEM", "--tenant-id", tenantA,
+        "--dry-run");
+      assertTrue("SYSTEM.CHILD_LINK sync must succeed", childLinkJob.isSuccessful());
+      assertScanRangesAreTenantBounded(sysChildLink, tenantA, tenantB);
+    } finally {
+      TestUtil.removeCoprocessor(sourceConnection, sysCatalog, TenantIdRecordingObserver.class);
+      TestUtil.removeCoprocessor(sourceConnection, sysChildLink, TenantIdRecordingObserver.class);
+      TenantIdRecordingObserver.reset();
+      // Clean up checkpoint entries for both SYSTEM tables so subsequent tests start clean.
+      cleanupCheckpointTable(sourceConnection, sysCatalog, targetZkQuorum, tenantA);
+      cleanupCheckpointTable(sourceConnection, sysChildLink, targetZkQuorum, tenantA);
+      try (Statement stmt = sourceConnection.createStatement()) {
+        stmt.execute("DROP TABLE IF EXISTS " + baseTable + " CASCADE");
+      } catch (SQLException e) {
+        LOGGER.warn("Failed to drop base table {}: {}", baseTable, e.getMessage());
+      }
+    }
+  }
+
+  private void logRegions(Admin admin, String tableName) throws IOException {
+    java.util.List<org.apache.hadoop.hbase.client.RegionInfo> regions =
+      admin.getRegions(TableName.valueOf(tableName));
+    LOGGER.info("=== {} has {} regions on source cluster ===", tableName, regions.size());
+    for (org.apache.hadoop.hbase.client.RegionInfo r : regions) {
+      LOGGER.info("  region: startKey={} endKey={}", Bytes.toStringBinary(r.getStartKey()),
+        Bytes.toStringBinary(r.getEndKey()));
+    }
+  }
+
+  private void splitAndWait(Admin admin, TableName table, byte[] splitKey) throws Exception {
+    int before = admin.getRegions(table).size();
+    admin.split(table, splitKey);
+    long deadline = System.currentTimeMillis() + 60_000;
+    while (System.currentTimeMillis() < deadline) {
+      java.util.List<org.apache.hadoop.hbase.client.RegionInfo> regions = admin.getRegions(table);
+      if (regions.size() > before) {
+        boolean found = false;
+        for (org.apache.hadoop.hbase.client.RegionInfo r : regions) {
+          if (Bytes.equals(r.getStartKey(), splitKey) || Bytes.equals(r.getEndKey(), splitKey)) {
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          return;
+        }
+      }
+      Thread.sleep(200);
+    }
+    throw new IllegalStateException(
+      "Split of " + table + " at " + Bytes.toStringBinary(splitKey) + " did not complete in 60s");
+  }
+
+  /**
+   * Asserts that every scan issued against {@code tableName} is tightly range-bounded within
+   * {@code allowedTenant}'s keyspace — meaning no scan can traverse into {@code forbiddenTenant}
+   * rows regardless of what actually lives in the table. For each recorded {@code [startRow,
+   * stopRow)} we require that either the range is fully contained within the byte-lexicographic
+   * interval {@code [allowedTenant\0, allowedTenant\0+1)} (tenant-scoped scan), or that the whole
+   * range is strictly less than {@code allowedTenant\0} (a global / null-tenant scan). Anything
+   * else — including an open-ended {@code [allowedTenant, +∞)} — would allow the scanner to cross
+   * into {@code forbiddenTenant} rows and is rejected.
+   */
+  private void assertScanRangesAreTenantBounded(String tableName, String allowedTenant,
+    String forbiddenTenant) {
+    List<byte[][]> ranges = TenantIdRecordingObserver.SCAN_RANGES_BY_TABLE.get(tableName);
+    assertNotNull("Expected at least one scan recorded against " + tableName, ranges);
+    assertFalse("Expected at least one scan recorded against " + tableName, ranges.isEmpty());
+    LOGGER.info("=== SYNC_TABLE_CHUNK_FORMATION scans recorded against {} (count={}) ===", tableName,
+      ranges.size());
+    for (int i = 0; i < ranges.size(); i++) {
+      byte[] start = ranges.get(i)[0];
+      byte[] stop = ranges.get(i)[1];
+      LOGGER.info("  scan[{}]: startRow={} ({}b) stopRow={} ({}b)", i, Bytes.toStringBinary(start),
+        start.length, Bytes.toStringBinary(stop), stop.length);
+    }
+    LOGGER.info("=== end scans against {} ===", tableName);
+
+    // The table was pre-split at `forbiddenTenant`, so regions >= forbiddenTenant contain only
+    // rows for tenants forbiddenTenant and later. If the tool respects --tenant-id=allowedTenant
+    // at split-time, no scan should start at or after forbiddenTenant. If any does, the tool is
+    // reading rows outside the requested tenant — this is the defect this test is designed to
+    // surface.
+    byte[] forbiddenLower = Bytes.toBytes(forbiddenTenant);
+    for (byte[][] range : ranges) {
+      byte[] start = range[0];
+      byte[] stop = range[1];
+      boolean startsInForbiddenRegion =
+        start.length > 0 && Bytes.compareTo(start, forbiddenLower) >= 0;
+      assertFalse(
+        "Scan against " + tableName + " with --tenant-id=" + allowedTenant + " starts at "
+          + Bytes.toStringBinary(start) + " which is inside the pre-split region for tenant "
+          + forbiddenTenant + " (stopRow=" + Bytes.toStringBinary(stop)
+          + "). --tenant-id must not read into other tenants' regions.",
+        startsInForbiddenRegion);
+    }
   }
 
   @Test
@@ -3515,6 +3740,54 @@ public class PhoenixSyncTableToolIT {
   }
 
   /**
+   * Creates an updatable view over the base table on both clusters.
+   */
+  private void createViewOnBothClusters(Connection sourceConn, Connection targetConn,
+    String viewName, String baseTableName) throws SQLException {
+    String viewDdl =
+      String.format("CREATE VIEW IF NOT EXISTS %s AS SELECT * FROM %s", viewName, baseTableName);
+    sourceConn.createStatement().execute(viewDdl);
+    sourceConn.commit();
+    targetConn.createStatement().execute(viewDdl);
+    targetConn.commit();
+  }
+
+  /**
+   * Creates a global index on a view on both clusters. Physical storage is the shared
+   * {@code _IDX_&lt;baseTable&gt;} HBase table.
+   */
+  private void createViewIndexOnBothClusters(Connection sourceConn, Connection targetConn,
+    String viewName, String viewIndexName) throws SQLException {
+    String indexDdl = String.format(
+      "CREATE INDEX IF NOT EXISTS %s ON %s (NAME) INCLUDE (NAME_VALUE)", viewIndexName, viewName);
+    sourceConn.createStatement().execute(indexDdl);
+    sourceConn.commit();
+    targetConn.createStatement().execute(indexDdl);
+    targetConn.commit();
+  }
+
+  /**
+   * Waits until a Phoenix index (including view indexes) has the expected row count on the target.
+   * Unlike {@link #waitForReplication}, this does not use {@code NO_INDEX} so the count is read from
+   * the index itself.
+   */
+  private void waitForIndexRowCount(Connection targetConn, String indexName, int expectedRows)
+    throws Exception {
+    long startTime = System.currentTimeMillis();
+    String countQuery = "SELECT COUNT(*) FROM " + indexName;
+    while (System.currentTimeMillis() - startTime < REPLICATION_WAIT_TIMEOUT_MS) {
+      try (ResultSet rs = targetConn.createStatement().executeQuery(countQuery)) {
+        rs.next();
+        if (rs.getInt(1) == expectedRows) {
+          return;
+        }
+      }
+      Thread.sleep(200);
+    }
+    fail("Index replication timeout: expected " + expectedRows + " rows in " + indexName);
+  }
+
+  /**
    * Attempts to split a table at the specified row ID using HBase Admin API. Ignores errors if the
    * split fails (e.g., region in transition).
    */
@@ -4711,6 +4984,38 @@ public class PhoenixSyncTableToolIT {
     public void preBatchMutate(ObserverContext<RegionCoprocessorEnvironment> c,
       MiniBatchOperationInProgress<Mutation> miniBatchOp) throws IOException {
       throw new DoNotRetryIOException("INJECTED TARGET REPAIR WRITE FAIL");
+    }
+  }
+
+  /**
+   * RegionObserver that records the {@code (startRow, stopRow)} pair of every incoming Scan, keyed
+   * by HBase table name. Used by {@link #testSyncToolReadsTenantScopedSystemCatalogAndChildLink} to
+   * prove that scans issued against SYSTEM.CATALOG / SYSTEM.CHILD_LINK for {@code --tenant-id T}
+   * are tightly range-bounded within {@code T}'s keyspace — start-row prefix alone doesn't rule
+   * out a scan of {@code [T, +∞)} that leaks into other tenants.
+   */
+  public static class TenantIdRecordingObserver extends SimpleRegionObserver {
+    public static final Map<String, List<byte[][]>> SCAN_RANGES_BY_TABLE = new ConcurrentHashMap<>();
+
+    public static void reset() {
+      SCAN_RANGES_BY_TABLE.clear();
+    }
+
+    @Override
+    public void preScannerOpen(ObserverContext<RegionCoprocessorEnvironment> c, Scan scan) {
+      // Only record scans originated by the PhoenixSyncTableMapper — Phoenix's own control-plane
+      // scans (metadata bootstrap, RPC-level lookups) also hit these SYSTEM tables and are not
+      // what --tenant-id is supposed to constrain.
+      if (scan.getAttribute(BaseScannerRegionObserverConstants.SYNC_TABLE_CHUNK_FORMATION) == null) {
+        return;
+      }
+      String tableName = c.getEnvironment().getRegion().getTableDescriptor().getTableName()
+        .getNameAsString();
+      byte[] startRow = scan.getStartRow() == null ? HConstants.EMPTY_BYTE_ARRAY : scan.getStartRow();
+      byte[] stopRow = scan.getStopRow() == null ? HConstants.EMPTY_BYTE_ARRAY : scan.getStopRow();
+      SCAN_RANGES_BY_TABLE
+        .computeIfAbsent(tableName, k -> Collections.synchronizedList(new ArrayList<>()))
+        .add(new byte[][] { startRow, stopRow });
     }
   }
 }
